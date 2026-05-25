@@ -61,7 +61,20 @@ export async function bibToCSL(
 
   const args = [bibPath, '-t', 'csljson', '--quiet'];
 
-  const res = await execa(pathToPandoc, args);
+  let res;
+  try {
+    res = await execa(pathToPandoc, args);
+  } catch (e) {
+    const stderr = (e as any)?.stderr || (e as any)?.shortMessage || '';
+    if (/Unknown output format csljson/.test(stderr)) {
+      throw new Error(
+        `Pandoc at '${pathToPandoc}' does not support CSL JSON output. ` +
+          'Please install Pandoc 2.11 or newer, then update the Pandoc path in this plugin settings if needed.'
+      );
+    }
+
+    throw e;
+  }
 
   if (res.stderr) {
     throw new Error(`bibToCSL: ${res.stderr}`);

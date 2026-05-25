@@ -3,8 +3,11 @@ import {
   MarkdownView,
   Menu,
   Plugin,
+  TAbstractFile,
+  TFile,
   WorkspaceLeaf,
   debounce,
+  normalizePath,
   setIcon,
 } from 'obsidian';
 import which from 'which';
@@ -26,9 +29,77 @@ import { TooltipManager } from './tooltip';
 import { ReferenceListView, viewType } from './view';
 import { PromiseCapability, fixPath, getVaultRoot } from './helpers';
 import path from 'path';
-import { BibManager } from './bib/bibManager';
+import { BibManager, getScopedSettings } from './bib/bibManager';
 import { CiteSuggest } from './citeSuggest/citeSuggest';
 import { isZoteroRunning } from './bib/helpers';
+
+const bibliographyExtensions = new Set(['bib', 'json', 'yaml', 'yml']);
+
+function isBibliographyFile(file: TAbstractFile): file is TFile {
+  return file instanceof TFile && bibliographyExtensions.has(file.extension);
+}
+
+function getFileRelativePath(sourceFile: TFile, targetPath: string) {
+  const sourceDir = path.posix.dirname(sourceFile.path);
+  const relativePath = path.posix.relative(sourceDir, targetPath);
+
+  return relativePath || path.posix.basename(targetPath);
+}
+
+function bibliographyMatchesPath(
+  sourceFile: TFile,
+  bibliography: string,
+  targetPath: string
+) {
+  const sourceDir = path.posix.dirname(sourceFile.path);
+  const normalizedBibliography = normalizePath(bibliography);
+  const noteRelativePath = normalizePath(
+    path.posix.join(sourceDir, normalizedBibliography)
+  );
+  const vaultRelativePath = normalizePath(normalizedBibliography);
+
+  if (noteRelativePath === targetPath || vaultRelativePath === targetPath) {
+    return true;
+  }
+
+  if (path.isAbsolute(bibliography)) {
+    const targetFilePath = path.join(getVaultRoot(), targetPath);
+    return path.normalize(bibliography) === path.normalize(targetFilePath);
+  }
+
+  return false;
+}
+
+function updateBibliographyPath(
+  sourceFile: TFile,
+  bibliography: unknown,
+  oldPath: string,
+  newPath: string
+) {
+  const getUpdatedPath = (value: unknown) => {
+    if (
+      typeof value === 'string' &&
+      bibliographyMatchesPath(sourceFile, value, oldPath)
+    ) {
+      return getFileRelativePath(sourceFile, newPath);
+    }
+
+    return value;
+  };
+
+  if (Array.isArray(bibliography)) {
+    let changed = false;
+    const updated = bibliography.map((value) => {
+      const next = getUpdatedPath(value);
+      changed ||= next !== value;
+      return next;
+    });
+
+    return changed ? updated : bibliography;
+  }
+
+  return getUpdatedPath(bibliography);
+}
 
 export default class ReferenceList extends Plugin {
   settings: ReferenceListSettings;
@@ -152,6 +223,30 @@ export default class ReferenceList extends Plugin {
       )
     );
 
+    this.registerEvent(
+      app.vault.on(
+        'rename',
+        debounce(
+          async (file, oldPath) => {
+            await this.initPromise.promise;
+            await this.bibManager.initPromise.promise;
+
+            if (isBibliographyFile(file)) {
+              await this.updateBibliographyFrontmatter(oldPath, file.path);
+            }
+
+            const activeView = app.workspace.getActiveViewOfType(MarkdownView);
+            if (activeView?.file instanceof TFile) {
+              this.bibManager.fileCache.delete(activeView.file);
+              this.processReferences();
+            }
+          },
+          100,
+          true
+        )
+      )
+    );
+
     (async () => {
       this.initStatusBar();
       this.setStatusBarLoading();
@@ -170,6 +265,39 @@ export default class ReferenceList extends Plugin {
       .getLeavesOfType(viewType)
       .forEach((leaf) => leaf.detach());
     this.bibManager.destroy();
+  }
+
+  async updateBibliographyFrontmatter(oldPath: string, newPath: string) {
+    oldPath = normalizePath(oldPath);
+    newPath = normalizePath(newPath);
+
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      const metadata = this.app.metadataCache.getFileCache(file);
+      if (!metadata?.frontmatter?.bibliography) continue;
+
+      let changed = false;
+      try {
+        await this.app.fileManager.processFrontMatter(file, (frontmatter) => {
+          const nextBibliography = updateBibliographyPath(
+            file,
+            frontmatter.bibliography,
+            oldPath,
+            newPath
+          );
+
+          if (nextBibliography !== frontmatter.bibliography) {
+            frontmatter.bibliography = nextBibliography;
+            changed = true;
+          }
+        });
+
+        if (changed) {
+          this.bibManager.fileCache.delete(file);
+        }
+      } catch (e) {
+        console.error(e);
+      }
+    }
   }
 
   statusBarIcon: HTMLElement;
@@ -324,7 +452,16 @@ export default class ReferenceList extends Plugin {
 
   processReferences = async () => {
     const { settings, view } = this;
-    if (!settings.pathToBibliography && !settings.pullFromZotero) {
+    const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+    const scopedSettings = activeView
+      ? getScopedSettings(activeView.file)
+      : null;
+
+    if (
+      !settings.pathToBibliography &&
+      !settings.pullFromZotero &&
+      !scopedSettings?.bibliography?.length
+    ) {
       return view?.setMessage(
         t(
           'Please provide the path to your pandoc compatible bibliography file in the Pandoc Reference List plugin settings.'
@@ -332,7 +469,6 @@ export default class ReferenceList extends Plugin {
       );
     }
 
-    const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
     if (activeView) {
       try {
         const fileContent = await this.app.vault.cachedRead(activeView.file);
@@ -355,6 +491,7 @@ export default class ReferenceList extends Plugin {
         }
       } catch (e) {
         console.error(e);
+        view?.setMessage((e as Error).message);
       }
     } else {
       view?.setNoContentMessage();

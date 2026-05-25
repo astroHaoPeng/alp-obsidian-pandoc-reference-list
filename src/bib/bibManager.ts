@@ -1,6 +1,6 @@
 import { EditorView } from '@codemirror/view';
 import CSL from 'citeproc';
-import ReferenceList from 'src/main';
+import type ReferenceList from 'src/main';
 import { PartialCSLEntry } from './types';
 import Fuse from 'fuse.js';
 import {
@@ -44,7 +44,7 @@ const fuseSettings = {
 interface ScopedSettings {
   style?: string;
   lang?: string;
-  bibliography?: string;
+  bibliography?: string[];
 }
 
 export interface FileCache {
@@ -64,7 +64,35 @@ export interface FileCache {
   };
 }
 
-function getScopedSettings(file: TFile): ScopedSettings {
+function getFrontmatterString(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+
+  const trimmed = value.trim();
+  return trimmed || undefined;
+}
+
+function getFrontmatterStringList(value: unknown): string[] {
+  const values = Array.isArray(value) ? value : [value];
+  return values
+    .map(getFrontmatterString)
+    .filter((v): v is string => !!v);
+}
+
+function resolveScopedPath(file: TFile, scopedPath: string) {
+  if (path.isAbsolute(scopedPath)) return scopedPath;
+
+  const relativeToNote = path.join(
+    getVaultRoot(),
+    path.dirname(file.path),
+    scopedPath
+  );
+
+  if (existsSync(relativeToNote)) return relativeToNote;
+
+  return scopedPath;
+}
+
+export function getScopedSettings(file: TFile): ScopedSettings | null {
   const metadata = app.metadataCache.getFileCache(file);
   const output: ScopedSettings = {};
 
@@ -74,23 +102,21 @@ function getScopedSettings(file: TFile): ScopedSettings {
 
   const { frontmatter } = metadata;
 
-  output.bibliography = frontmatter.bibliography?.trim() || undefined;
+  const bibliography = getFrontmatterStringList(frontmatter.bibliography).map(
+    (bibPath) => resolveScopedPath(file, bibPath)
+  );
+  output.bibliography = bibliography.length ? bibliography : undefined;
   output.style =
-    frontmatter.csl?.trim() ||
-    frontmatter['citation-style']?.trim() ||
+    getFrontmatterString(frontmatter.csl) ||
+    getFrontmatterString(frontmatter['citation-style']) ||
     undefined;
   output.lang =
-    frontmatter.lang?.trim() ||
-    frontmatter['citation-language']?.trim() ||
+    getFrontmatterString(frontmatter.lang) ||
+    getFrontmatterString(frontmatter['citation-language']) ||
     undefined;
 
   if (Object.values(output).every((v) => !v)) {
     return null;
-  }
-
-  // Checks whether the bibliography is a relative path and replaces the path with an absolute one
-  if (existsSync(path.join(getVaultRoot(), path.dirname(file.path), output.bibliography))){
-    output.bibliography = path.join(getVaultRoot(), path.dirname(file.path), output.bibliography);
   }
 
   return output;
@@ -156,8 +182,10 @@ export class BibManager {
       max: 10,
       noDisposeOnSet: true,
       dispose: (cache) => {
-        if (cache.settings?.bibliography) {
-          this.clearWatcher(cache.settings.bibliography);
+        if (cache.settings?.bibliography?.length) {
+          for (const bibPath of cache.settings.bibliography) {
+            this.clearBibliographyWatcher(bibPath);
+          }
         }
       },
     });
@@ -183,6 +211,16 @@ export class BibManager {
     if (this.watcherCache.has(path)) {
       this.watcherCache.get(path).close();
       this.watcherCache.delete(path);
+    }
+  }
+
+  clearBibliographyWatcher(path: string) {
+    this.clearWatcher(path);
+
+    try {
+      this.clearWatcher(getBibPath(path, getVaultRoot));
+    } catch {
+      // The file may already be gone; clearing the original key is enough then.
     }
   }
 
@@ -245,6 +283,7 @@ export class BibManager {
         style = settings.style;
       } catch (e) {
         console.error(e);
+        this.plugin.view?.setMessage((e as Error).message);
         return this;
       }
     }
@@ -255,17 +294,23 @@ export class BibManager {
         lang = settings.lang;
       } catch (e) {
         console.error(e);
+        this.plugin.view?.setMessage((e as Error).message);
         return this;
       }
     }
 
-    if (settings.bibliography) {
+    if (settings.bibliography?.length) {
       try {
-        const bib = await bibToCSL(
-          settings.bibliography,
-          this.plugin.settings.pathToPandoc,
-          getVaultRoot
-        );
+        const bib: PartialCSLEntry[] = [];
+        for (const bibPath of settings.bibliography) {
+          bib.push(
+            ...(await bibToCSL(
+              bibPath,
+              this.plugin.settings.pathToPandoc,
+              getVaultRoot
+            ))
+          );
+        }
         bibCache = new Map();
 
         for (const entry of bib) {
@@ -275,7 +320,7 @@ export class BibManager {
         fuse = new Fuse(bib, fuseSettings);
       } catch (e) {
         console.error(e);
-        return this;
+        throw e;
       }
     }
 
@@ -625,13 +670,12 @@ export class BibManager {
       })
     );
 
-    const areSettingsEqual =
-      settings?.bibliography === cachedDoc?.settings?.bibliography &&
-      settings?.style === cachedDoc?.settings?.style &&
-      settings?.lang === cachedDoc?.settings?.lang;
+    const areSettingsEqual = equal(settings, cachedDoc?.settings);
 
-    if (!areSettingsEqual && cachedDoc?.settings?.bibliography) {
-      this.clearWatcher(cachedDoc.settings.bibliography);
+    if (!areSettingsEqual && cachedDoc?.settings?.bibliography?.length) {
+      for (const bibPath of cachedDoc.settings.bibliography) {
+        this.clearBibliographyWatcher(bibPath);
+      }
     }
 
     const source =
@@ -639,24 +683,33 @@ export class BibManager {
         ? cachedDoc.source
         : await this.loadScopedEngine(settings);
 
-    if (settings?.bibliography) {
-      const bibPath = getBibPath(settings.bibliography, getVaultRoot);
-      if (!this.watcherCache.has(bibPath)) {
-        let dbTimer = 0;
-        this.watcherCache.set(
-          bibPath,
-          watch(bibPath, (evt) => {
-            if (evt === 'change') {
-              clearTimeout(dbTimer);
-              dbTimer = activeWindow.setTimeout(() => {
-                this.fileCache.delete(file);
-                this.plugin.processReferences();
-              }, 100);
-            } else {
-              this.clearWatcher(bibPath);
-            }
-          })
-        );
+    if (settings?.bibliography?.length) {
+      for (const scopedBibPath of settings.bibliography) {
+        let bibPath: string;
+        try {
+          bibPath = getBibPath(scopedBibPath, getVaultRoot);
+        } catch (e) {
+          console.error(e);
+          continue;
+        }
+
+        if (!this.watcherCache.has(bibPath)) {
+          let dbTimer = 0;
+          this.watcherCache.set(
+            bibPath,
+            watch(bibPath, (evt) => {
+              if (evt === 'change') {
+                clearTimeout(dbTimer);
+                dbTimer = activeWindow.setTimeout(() => {
+                  this.fileCache.delete(file);
+                  this.plugin.processReferences();
+                }, 100);
+              } else {
+                this.clearWatcher(bibPath);
+              }
+            })
+          );
+        }
       }
     }
 
@@ -739,7 +792,10 @@ export class BibManager {
       : null;
 
     if (parsed) {
-      if (this.plugin.settings.pullFromZotero && !settings?.bibliography) {
+      if (
+        this.plugin.settings.pullFromZotero &&
+        !settings?.bibliography?.length
+      ) {
         await this.getZLinksForKeys(resolvedKeys);
       }
       parsed = this.prepBibHTML(parsed, file);
